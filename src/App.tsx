@@ -531,6 +531,16 @@ const defaultProfile: AppProfile = {
   familySlug: "keluargaku",
 };
 
+function normalizeAppProfile(profile: AppProfile): AppProfile {
+  const familyName = profile.familyName?.trim() || defaultProfile.familyName;
+  return {
+    familyName,
+    subtitle: typeof profile.subtitle === "string" ? profile.subtitle : defaultProfile.subtitle,
+    hometown: typeof profile.hometown === "string" ? profile.hometown : defaultProfile.hometown,
+    familySlug: slugifyFamilyName(profile.familySlug || familyName),
+  };
+}
+
 const defaultSupabaseConfig: SupabaseConfig = {
   url: ENV_SUPABASE_URL,
   anonKey: ENV_SUPABASE_ANON_KEY,
@@ -803,10 +813,7 @@ function sanitizeMembersForReadOnlyShare(members: Member[]) {
 
 function buildReadOnlyShareSnapshot(profile: AppProfile, members: Member[]): ReadOnlyShareSnapshot {
   return {
-    profile: {
-      ...profile,
-      familySlug: slugifyFamilyName(profile.familySlug || profile.familyName),
-    },
+    profile: normalizeAppProfile(profile),
     members: sanitizeMembersForReadOnlyShare(members),
     sharedAt: new Date().toISOString(),
     hiddenFields: {
@@ -815,6 +822,41 @@ function buildReadOnlyShareSnapshot(profile: AppProfile, members: Member[]): Rea
       notes: true,
     },
   };
+}
+
+async function refreshActiveReadOnlyShareLinks(
+  config: SupabaseConfig,
+  profile: AppProfile,
+  members: Member[],
+  session: Session | null
+) {
+  const links = await listFamilyShareLinksInSupabase(
+    config,
+    profile.familySlug || profile.familyName,
+    session
+  );
+
+  let updatedCount = 0;
+  const updatedLinks = await Promise.all(
+    links.map(async (link) => {
+      if (!link.isActive) return link;
+      const snapshot = await refreshFamilyShareLinkSnapshotInSupabase(
+        config,
+        link.shareToken,
+        profile,
+        members,
+        session
+      );
+      updatedCount += 1;
+      return {
+        ...link,
+        snapshot,
+        updatedAt: new Date().toISOString(),
+      };
+    })
+  );
+
+  return { updatedLinks, updatedCount };
 }
 
 function readPublicShareConfigFromLocation() {
@@ -1559,7 +1601,7 @@ function sanitizeImportedMembers(data: unknown): Member[] | null {
     })
     .filter((member) => member.name);
 
-  return normalized.length ? normalized : null;
+  return normalized;
 }
 
 function parseCsvLine(line: string) {
@@ -2894,6 +2936,38 @@ export default function KeluargaKuMVP() {
   }, [profile]);
 
   useEffect(() => {
+    if (!authState.session || !supabaseConfig.enabled) return;
+    if (!familyShareLinks.some((link) => link.isActive)) return;
+
+    const normalizedProfile = normalizeAppProfile(profile);
+    const timer = window.setTimeout(async () => {
+      try {
+        const refreshed = await refreshActiveReadOnlyShareLinks(
+          supabaseConfig,
+          normalizedProfile,
+          members,
+          authState.session
+        );
+        setFamilyShareLinks(refreshed.updatedLinks);
+      } catch {
+        // Abaikan error auto-refresh profil agar tidak mengganggu input utama.
+      }
+    }, 800);
+
+    return () => window.clearTimeout(timer);
+  }, [
+    profile.familyName,
+    profile.subtitle,
+    profile.hometown,
+    members,
+    authState.session,
+    supabaseConfig.enabled,
+    supabaseConfig.url,
+    supabaseConfig.anonKey,
+    familyShareLinks,
+  ]);
+
+  useEffect(() => {
     saveSupabaseConfig(supabaseConfig);
   }, [supabaseConfig]);
 
@@ -3481,48 +3555,29 @@ export default function KeluargaKuMVP() {
   const handlePushToCloud = async () => {
     try {
       setCloudSyncStatus({ type: "loading", message: "Mengirim data keluarga ke Supabase..." });
+      const normalizedProfile = normalizeAppProfile(profile);
       const payload: BackupPackage = {
         schemaVersion: APP_SCHEMA_VERSION,
         exportedAt: new Date().toISOString(),
         storageDriver: "supabase",
-        profile: {
-          ...profile,
-          familySlug: slugifyFamilyName(profile.familySlug || profile.familyName),
-        },
+        profile: normalizedProfile,
         members,
       };
 
       await pushFamilyBackupToSupabase(supabaseConfig, payload, authState.session);
       markBackupSaved();
+      setProfile(normalizedProfile);
 
       let updatedShareCount = 0;
       try {
-        const links = await listFamilyShareLinksInSupabase(
+        const refreshed = await refreshActiveReadOnlyShareLinks(
           supabaseConfig,
-          payload.profile.familySlug,
+          normalizedProfile,
+          members,
           authState.session
         );
-
-        const updatedLinks = await Promise.all(
-          links.map(async (link) => {
-            if (!link.isActive) return link;
-            const snapshot = await refreshFamilyShareLinkSnapshotInSupabase(
-              supabaseConfig,
-              link.shareToken,
-              profile,
-              members,
-              authState.session
-            );
-            updatedShareCount += 1;
-            return {
-              ...link,
-              snapshot,
-              updatedAt: new Date().toISOString(),
-            };
-          })
-        );
-
-        setFamilyShareLinks(updatedLinks);
+        updatedShareCount = refreshed.updatedCount;
+        setFamilyShareLinks(refreshed.updatedLinks);
       } catch {
         // Jika refresh snapshot gagal, push data utama tetap dianggap berhasil.
       }
