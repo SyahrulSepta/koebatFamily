@@ -541,6 +541,46 @@ function normalizeAppProfile(profile: AppProfile): AppProfile {
   };
 }
 
+const MAX_PHOTO_DIMENSION = 960;
+const LARGE_PHOTO_BYTES = 1024 * 1024 * 1.5;
+
+async function resizeImageFileToDataUrl(
+  file: File,
+  options?: { maxWidth?: number; maxHeight?: number; quality?: number }
+) {
+  const maxWidth = options?.maxWidth ?? MAX_PHOTO_DIMENSION;
+  const maxHeight = options?.maxHeight ?? MAX_PHOTO_DIMENSION;
+  const quality = options?.quality ?? 0.78;
+
+  const dataUrl = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(new Error("Gagal membaca file gambar."));
+    reader.readAsDataURL(file);
+  });
+
+  const image = await new Promise<HTMLImageElement>((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("Gagal memuat gambar."));
+    img.src = dataUrl;
+  });
+
+  const ratio = Math.min(maxWidth / image.width, maxHeight / image.height, 1);
+  const targetWidth = Math.max(1, Math.round(image.width * ratio));
+  const targetHeight = Math.max(1, Math.round(image.height * ratio));
+
+  const canvas = document.createElement("canvas");
+  canvas.width = targetWidth;
+  canvas.height = targetHeight;
+
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Canvas tidak tersedia untuk memproses gambar.");
+
+  ctx.drawImage(image, 0, 0, targetWidth, targetHeight);
+  return canvas.toDataURL("image/jpeg", quality);
+}
+
 const defaultSupabaseConfig: SupabaseConfig = {
   url: ENV_SUPABASE_URL,
   anonKey: ENV_SUPABASE_ANON_KEY,
@@ -2502,12 +2542,23 @@ function MemberFormDialog({
   const selectedSpouse = members.find((member) => member.id === normalizeSelectValue(form.spouseId));
 
   const onFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => setForm((prev) => ({ ...prev, photo: String(reader.result || "") }));
-    reader.readAsDataURL(file);
-  };
+  const file = event.target.files?.[0];
+  if (!file) return;
+
+  try {
+    const optimizedPhoto = await resizeImageFileToDataUrl(file, {
+      maxWidth: MAX_PHOTO_DIMENSION,
+      maxHeight: MAX_PHOTO_DIMENSION,
+      quality: file.size > LARGE_PHOTO_BYTES ? 0.72 : 0.82,
+    });
+
+    setForm((prev) => ({ ...prev, photo: optimizedPhoto }));
+  } catch {
+    window.alert("Foto gagal diproses. Coba pilih gambar lain atau ukuran yang lebih kecil.");
+  } finally {
+    event.target.value = "";
+  }
+};
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
