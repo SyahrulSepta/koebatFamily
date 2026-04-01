@@ -3491,11 +3491,48 @@ export default function KeluargaKuMVP() {
         },
         members,
       };
+
       await pushFamilyBackupToSupabase(supabaseConfig, payload, authState.session);
       markBackupSaved();
+
+      let updatedShareCount = 0;
+      try {
+        const links = await listFamilyShareLinksInSupabase(
+          supabaseConfig,
+          payload.profile.familySlug,
+          authState.session
+        );
+
+        const updatedLinks = await Promise.all(
+          links.map(async (link) => {
+            if (!link.isActive) return link;
+            const snapshot = await refreshFamilyShareLinkSnapshotInSupabase(
+              supabaseConfig,
+              link.shareToken,
+              profile,
+              members,
+              authState.session
+            );
+            updatedShareCount += 1;
+            return {
+              ...link,
+              snapshot,
+              updatedAt: new Date().toISOString(),
+            };
+          })
+        );
+
+        setFamilyShareLinks(updatedLinks);
+      } catch {
+        // Jika refresh snapshot gagal, push data utama tetap dianggap berhasil.
+      }
+
       setCloudSyncStatus({
         type: "success",
-        message: `Push berhasil untuk keluarga ${payload.profile.familySlug}.`,
+        message:
+          updatedShareCount > 0
+            ? `Push berhasil untuk keluarga ${payload.profile.familySlug}. ${updatedShareCount} link baca-saja aktif ikut diperbarui otomatis.`
+            : `Push berhasil untuk keluarga ${payload.profile.familySlug}.`,
       });
     } catch (error) {
       setCloudSyncStatus({
