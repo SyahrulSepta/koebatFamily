@@ -372,6 +372,7 @@ type Member = {
   fatherId?: string;
   motherId?: string;
   spouseId?: string;
+  spouseIds?: string[];
   notes?: string;
   createdAt: string;
   updatedAt: string;
@@ -1139,6 +1140,42 @@ function normalizeSelectValue(value?: string) {
   return !value || value === "unassigned" ? undefined : value;
 }
 
+function uniqueRelationshipIds(values: Array<string | undefined>) {
+  return [...new Set(values.filter((value): value is string => Boolean(value)))];
+}
+
+function getSpouseIds(member?: Pick<Member, "spouseId" | "spouseIds">) {
+  if (!member) return [] as string[];
+  return uniqueRelationshipIds([member.spouseId, ...(member.spouseIds || [])]);
+}
+
+function getPrimarySpouseId(member?: Pick<Member, "spouseId" | "spouseIds">) {
+  return getSpouseIds(member)[0];
+}
+
+function applySpouseIds(member: Member, spouseIds: string[]) {
+  const normalized = uniqueRelationshipIds(spouseIds.filter((id) => id !== member.id));
+  return {
+    ...member,
+    spouseId: normalized[0],
+    spouseIds: normalized.length ? normalized : undefined,
+  };
+}
+
+function getCoParentIdForChild(child: Member, parentId?: string) {
+  if (!parentId) return undefined;
+  if (child.fatherId === parentId) return child.motherId;
+  if (child.motherId === parentId) return child.fatherId;
+  return undefined;
+}
+
+function getChildBranchLabel(child: Member, parentId: string, members: Member[]) {
+  const coParentId = getCoParentIdForChild(child, parentId);
+  const coParent = members.find((member) => member.id === coParentId);
+  if (coParent?.name) return `dengan ${coParent.name}`;
+  return "tanpa pasangan terhubung";
+}
+
 function initials(name: string) {
   return name
     .split(" ")
@@ -1522,23 +1559,24 @@ function calculateCouples(members: Member[]) {
   const memberMap = new Map(members.map((member) => [member.id, member]));
   const seen = new Set<string>();
 
-  return members.flatMap((member) => {
-    if (!member.spouseId) return [];
-    const spouse = memberMap.get(member.spouseId);
-    if (!spouse) return [];
+  return members.flatMap((member) =>
+    getSpouseIds(member).flatMap((spouseId) => {
+      const spouse = memberMap.get(spouseId);
+      if (!spouse) return [];
 
-    const key = [member.id, spouse.id].sort().join(":");
-    if (seen.has(key)) return [];
-    seen.add(key);
+      const key = [member.id, spouse.id].sort().join(":");
+      if (seen.has(key)) return [];
+      seen.add(key);
 
-    const childCount = members.filter((child) => {
-      const parentIds = [child.fatherId, child.motherId].filter(Boolean) as string[];
-      if (!parentIds.length) return false;
-      return parentIds.every((id) => id === member.id || id === spouse.id);
-    }).length;
+      const childCount = members.filter((child) => {
+        const parentIds = [child.fatherId, child.motherId].filter(Boolean) as string[];
+        if (!parentIds.length) return false;
+        return parentIds.every((id) => id === member.id || id === spouse.id);
+      }).length;
 
-    return [{ first: member, second: spouse, childCount }];
-  });
+      return [{ first: member, second: spouse, childCount }];
+    })
+  );
 }
 
 function calculateAddressSummary(members: Member[]) {
@@ -1620,6 +1658,13 @@ function sanitizeImportedMembers(data: unknown): Member[] | null {
           ? (item.gender as Gender)
           : "";
 
+      const spouseIds = uniqueRelationshipIds([
+        typeof item.spouseId === "string" ? item.spouseId : undefined,
+        ...(Array.isArray(item.spouseIds)
+          ? item.spouseIds.filter((value): value is string => typeof value === "string")
+          : []),
+      ]);
+
       return {
         id:
           typeof item.id === "string" && item.id.trim()
@@ -1633,7 +1678,8 @@ function sanitizeImportedMembers(data: unknown): Member[] | null {
         photo: typeof item.photo === "string" ? item.photo : "",
         fatherId: typeof item.fatherId === "string" ? item.fatherId : undefined,
         motherId: typeof item.motherId === "string" ? item.motherId : undefined,
-        spouseId: typeof item.spouseId === "string" ? item.spouseId : undefined,
+        spouseId: spouseIds[0],
+        spouseIds: spouseIds.length ? spouseIds : undefined,
         notes: typeof item.notes === "string" ? item.notes : "",
         createdAt,
         updatedAt,
@@ -1721,12 +1767,14 @@ function sanitizeImportedCsv(text: string): Member[] | null {
     const fatherName = (record.fatherName || "").trim().toLowerCase();
     const motherName = (record.motherName || "").trim().toLowerCase();
     const spouseName = (record.spouseName || "").trim().toLowerCase();
+    const spouseId = spouseName ? nameMap.get(spouseName) : undefined;
 
     return {
       ...member,
       fatherId: fatherName ? nameMap.get(fatherName) : undefined,
       motherId: motherName ? nameMap.get(motherName) : undefined,
-      spouseId: spouseName ? nameMap.get(spouseName) : undefined,
+      spouseId,
+      spouseIds: spouseId ? [spouseId] : undefined,
     };
   });
 }
@@ -1781,7 +1829,6 @@ function calculateRelationshipWarnings(members: Member[]): RelationWarning[] {
     const relationEntries = [
       { key: "fatherId", label: "Ayah", value: member.fatherId },
       { key: "motherId", label: "Ibu", value: member.motherId },
-      { key: "spouseId", label: "Pasangan", value: member.spouseId },
     ] as const;
 
     relationEntries.forEach((entry) => {
@@ -1805,18 +1852,27 @@ function calculateRelationshipWarnings(members: Member[]): RelationWarning[] {
       }
     });
 
-    if (member.fatherId && member.motherId && member.fatherId === member.motherId) {
-      warnings.push({
-        memberId: member.id,
-        memberName: member.name,
-        type: "invalid_parent_pair",
-        message: "Ayah dan ibu mengarah ke anggota yang sama.",
-      });
-    }
-
-    if (member.spouseId) {
-      const spouse = memberMap.get(member.spouseId);
-      if (spouse && spouse.spouseId !== member.id) {
+    getSpouseIds(member).forEach((spouseId) => {
+      if (spouseId === member.id) {
+        warnings.push({
+          memberId: member.id,
+          memberName: member.name,
+          type: "self_reference",
+          message: "Pasangan mengarah ke dirinya sendiri.",
+        });
+        return;
+      }
+      const spouse = memberMap.get(spouseId);
+      if (!spouse) {
+        warnings.push({
+          memberId: member.id,
+          memberName: member.name,
+          type: "missing_reference",
+          message: "Salah satu pasangan mengarah ke anggota yang tidak ditemukan.",
+        });
+        return;
+      }
+      if (!getSpouseIds(spouse).includes(member.id)) {
         warnings.push({
           memberId: member.id,
           memberName: member.name,
@@ -1824,6 +1880,15 @@ function calculateRelationshipWarnings(members: Member[]): RelationWarning[] {
           message: `Pasangan dengan ${spouse.name} belum saling terhubung dua arah.`,
         });
       }
+    });
+
+    if (member.fatherId && member.motherId && member.fatherId === member.motherId) {
+      warnings.push({
+        memberId: member.id,
+        memberName: member.name,
+        type: "invalid_parent_pair",
+        message: "Ayah dan ibu mengarah ke anggota yang sama.",
+      });
     }
   });
 
@@ -1838,12 +1903,15 @@ function autoFillRelationships(nextForm: FormState, members: Member[]) {
   const father = fatherId ? members.find((member) => member.id === fatherId) : undefined;
   const mother = motherId ? members.find((member) => member.id === motherId) : undefined;
 
-  if (father?.spouseId && !motherId && father.spouseId !== result.id) {
-    result.motherId = father.spouseId;
+  const fatherSpouseId = getPrimarySpouseId(father);
+  const motherSpouseId = getPrimarySpouseId(mother);
+
+  if (fatherSpouseId && !motherId && fatherSpouseId !== result.id) {
+    result.motherId = fatherSpouseId;
   }
 
-  if (mother?.spouseId && !fatherId && mother.spouseId !== result.id) {
-    result.fatherId = mother.spouseId;
+  if (motherSpouseId && !fatherId && motherSpouseId !== result.id) {
+    result.fatherId = motherSpouseId;
   }
 
   return result;
@@ -1857,8 +1925,11 @@ function autoFillRelationDraft(nextDraft: RelationDraft, members: Member[]) {
   const father = fatherId ? members.find((member) => member.id === fatherId) : undefined;
   const mother = motherId ? members.find((member) => member.id === motherId) : undefined;
 
-  if (father?.spouseId && !motherId) result.motherId = father.spouseId;
-  if (mother?.spouseId && !fatherId) result.fatherId = mother.spouseId;
+  const fatherSpouseId = getPrimarySpouseId(father);
+  const motherSpouseId = getPrimarySpouseId(mother);
+
+  if (fatherSpouseId && !motherId) result.motherId = fatherSpouseId;
+  if (motherSpouseId && !fatherId) result.fatherId = motherSpouseId;
 
   return result;
 }
@@ -2380,14 +2451,19 @@ function TreeNode({
   member,
   label,
   onSelect,
+  relationHint,
 }: {
   member?: Member;
   label: string;
   onSelect?: (id: string) => void;
+  relationHint?: string;
 }) {
   return (
     <div className="flex flex-col items-center gap-2">
-      <div className="text-xs uppercase tracking-wide text-slate-500">{label}</div>
+      <div className="text-center">
+        <div className="text-xs uppercase tracking-wide text-slate-500">{label}</div>
+        {relationHint ? <div className="mt-1 text-[11px] text-slate-400">{relationHint}</div> : null}
+      </div>
       {member ? (
         <button onClick={() => onSelect?.(member.id)} className="text-left">
           <div className="w-48 rounded-3xl border bg-white p-4 shadow-sm hover:shadow-md transition">
@@ -2416,13 +2492,17 @@ function DescendantCard({
   members,
   onSelect,
   visited = [],
+  relationHint,
 }: {
   member: Member;
   members: Member[];
   onSelect?: (id: string) => void;
   visited?: string[];
+  relationHint?: string;
 }) {
-  const spouse = member.spouseId ? members.find((candidate) => candidate.id === member.spouseId) : undefined;
+  const spouseMembers = getSpouseIds(member)
+    .map((spouseId) => members.find((candidate) => candidate.id === spouseId))
+    .filter(Boolean) as Member[];
   const birthOrder = getBirthOrder(member, members);
   const descendants = sortChildrenByBirthDate(
     members.filter(
@@ -2438,8 +2518,22 @@ function DescendantCard({
     <div className="rounded-3xl border bg-white p-4 shadow-sm">
       <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
         <div className="flex flex-wrap items-start gap-4">
-          <TreeNode label={birthOrder ? `Anak ke-${birthOrder}` : "Anak"} member={member} onSelect={onSelect} />
-          {spouse ? <TreeNode label="Pasangan" member={spouse} onSelect={onSelect} /> : null}
+          <TreeNode
+            label={birthOrder ? `Anak ke-${birthOrder}` : "Anak"}
+            member={member}
+            onSelect={onSelect}
+            relationHint={relationHint}
+          />
+          {spouseMembers.length ? (
+            spouseMembers.map((spouseMember, index) => (
+              <TreeNode
+                key={spouseMember.id}
+                label={`Pasangan ${index + 1}`}
+                member={spouseMember}
+                onSelect={onSelect}
+              />
+            ))
+          ) : null}
         </div>
 
         {hasDescendants ? (
@@ -2496,7 +2590,14 @@ function DescendantBranch({
   return (
     <div className="space-y-5">
       {descendants.map((child) => (
-        <DescendantCard key={child.id} member={child} members={members} onSelect={onSelect} visited={nextVisited} />
+        <DescendantCard
+          key={child.id}
+          member={child}
+          members={members}
+          onSelect={onSelect}
+          visited={nextVisited}
+          relationHint={getChildBranchLabel(child, parent.id, members)}
+        />
       ))}
     </div>
   );
@@ -2542,23 +2643,22 @@ function MemberFormDialog({
   const selectedSpouse = members.find((member) => member.id === normalizeSelectValue(form.spouseId));
 
   const onFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
-  const file = event.target.files?.[0];
-  if (!file) return;
+    const file = event.target.files?.[0];
+    if (!file) return;
 
-  try {
-    const optimizedPhoto = await resizeImageFileToDataUrl(file, {
-      maxWidth: MAX_PHOTO_DIMENSION,
-      maxHeight: MAX_PHOTO_DIMENSION,
-      quality: file.size > LARGE_PHOTO_BYTES ? 0.72 : 0.82,
-    });
-
-    setForm((prev) => ({ ...prev, photo: optimizedPhoto }));
-  } catch {
-    window.alert("Foto gagal diproses. Coba pilih gambar lain atau ukuran yang lebih kecil.");
-  } finally {
-    event.target.value = "";
-  }
-};
+    try {
+      const optimizedPhoto = await resizeImageFileToDataUrl(file, {
+        maxWidth: MAX_PHOTO_DIMENSION,
+        maxHeight: MAX_PHOTO_DIMENSION,
+        quality: file.size > LARGE_PHOTO_BYTES ? 0.72 : 0.82,
+      });
+      setForm((prev) => ({ ...prev, photo: optimizedPhoto }));
+    } catch {
+      window.alert("Foto gagal diproses. Coba pilih gambar lain atau ukuran yang lebih kecil.");
+    } finally {
+      event.target.value = "";
+    }
+  };
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -3453,55 +3553,48 @@ export default function KeluargaKuMVP() {
     setMembers((prev) => {
       let next = [...prev];
       const now = new Date().toISOString();
-      const newMember: Member = {
-        id: memberId,
-        name: form.name.trim(),
-        gender: form.gender || "",
-        birthDate: form.birthDate || undefined,
-        address: form.address.trim(),
-        phone: form.phone.trim(),
-        photo: form.photo || "",
-        fatherId: normalizedFatherId,
-        motherId: normalizedMotherId,
-        spouseId: normalizedSpouseId,
-        notes: form.notes?.trim() || "",
-        createdAt: form.id
-          ? prev.find((member) => member.id === form.id)?.createdAt || now
-          : now,
-        updatedAt: now,
-      };
+      const previousVersion = prev.find((member) => member.id === memberId);
+      const mergedSpouseIds = normalizedSpouseId
+        ? uniqueRelationshipIds([...(previousVersion ? getSpouseIds(previousVersion) : []), normalizedSpouseId])
+        : previousVersion
+        ? getSpouseIds(previousVersion)
+        : [];
 
-      const previousVersion = prev.find((member) => member.id === newMember.id);
-      if (previousVersion?.spouseId && previousVersion.spouseId !== newMember.spouseId) {
-        next = next.map((member) =>
-          member.id === previousVersion.spouseId ? { ...member, spouseId: undefined, updatedAt: now } : member
-        );
-      }
+      const newMember = applySpouseIds(
+        {
+          id: memberId,
+          name: form.name.trim(),
+          gender: form.gender || "",
+          birthDate: form.birthDate || undefined,
+          address: form.address.trim(),
+          phone: form.phone.trim(),
+          photo: form.photo || "",
+          fatherId: normalizedFatherId,
+          motherId: normalizedMotherId,
+          notes: form.notes?.trim() || "",
+          createdAt: previousVersion?.createdAt || now,
+          updatedAt: now,
+        },
+        mergedSpouseIds
+      );
 
       next = next.filter((member) => member.id !== newMember.id);
       next.push(newMember);
 
-      if (newMember.spouseId) {
+      if (mergedSpouseIds.length) {
         next = next.map((member) => {
-          if (member.id === newMember.spouseId) return { ...member, spouseId: newMember.id, updatedAt: now };
-          if (
-            member.id !== newMember.id &&
-            member.spouseId === newMember.id &&
-            member.id !== newMember.spouseId
-          ) {
-            return { ...member, spouseId: undefined, updatedAt: now };
-          }
-          return member;
+          if (!mergedSpouseIds.includes(member.id)) return member;
+          return applySpouseIds({ ...member, updatedAt: now }, [...getSpouseIds(member), newMember.id]);
         });
       }
 
       if (newMember.fatherId && newMember.motherId) {
         next = next.map((member) => {
-          if (member.id === newMember.fatherId && (!member.spouseId || member.spouseId === newMember.motherId)) {
-            return { ...member, spouseId: newMember.motherId, updatedAt: now };
+          if (member.id === newMember.fatherId) {
+            return applySpouseIds({ ...member, updatedAt: now }, [...getSpouseIds(member), newMember.motherId!]);
           }
-          if (member.id === newMember.motherId && (!member.spouseId || member.spouseId === newMember.fatherId)) {
-            return { ...member, spouseId: newMember.fatherId, updatedAt: now };
+          if (member.id === newMember.motherId) {
+            return applySpouseIds({ ...member, updatedAt: now }, [...getSpouseIds(member), newMember.fatherId!]);
           }
           return member;
         });
@@ -3950,43 +4043,38 @@ export default function KeluargaKuMVP() {
 
     setMembers((prev) => {
       const now = new Date().toISOString();
-      let next = prev.map((member) => {
-        if (member.id === selectedMember.id) {
-          return {
-            ...member,
-            fatherId: normalizedFatherId,
-            motherId: normalizedMotherId,
-            spouseId: normalizedSpouseId,
-            updatedAt: now,
-          };
-        }
-        return member;
-      });
-
-      next = next.map((member) => {
-        if (member.id === selectedMember.id) return member;
-        if (normalizedSpouseId && member.id === normalizedSpouseId) {
-          return { ...member, spouseId: selectedMember.id, updatedAt: now };
-        }
-        if (!normalizedSpouseId && member.spouseId === selectedMember.id) {
-          return { ...member, spouseId: undefined, updatedAt: now };
-        }
-        return member;
-      });
-
-      if (normalizedFatherId && normalizedMotherId) {
-        next = next.map((member) => {
-          if (member.id === normalizedFatherId && (!member.spouseId || member.spouseId === normalizedMotherId)) {
-            return { ...member, spouseId: normalizedMotherId, updatedAt: now };
+      return sortByName(
+        prev.map((member) => {
+          if (member.id === selectedMember.id) {
+            const spouseIds = normalizedSpouseId
+              ? uniqueRelationshipIds([...getSpouseIds(member), normalizedSpouseId])
+              : getSpouseIds(member);
+            return applySpouseIds(
+              {
+                ...member,
+                fatherId: normalizedFatherId,
+                motherId: normalizedMotherId,
+                updatedAt: now,
+              },
+              spouseIds
+            );
           }
-          if (member.id === normalizedMotherId && (!member.spouseId || member.spouseId === normalizedFatherId)) {
-            return { ...member, spouseId: normalizedFatherId, updatedAt: now };
+
+          if (normalizedSpouseId && member.id === normalizedSpouseId) {
+            return applySpouseIds({ ...member, updatedAt: now }, [...getSpouseIds(member), selectedMember.id]);
           }
+
+          if (normalizedFatherId && normalizedMotherId && member.id === normalizedFatherId) {
+            return applySpouseIds({ ...member, updatedAt: now }, [...getSpouseIds(member), normalizedMotherId]);
+          }
+
+          if (normalizedFatherId && normalizedMotherId && member.id === normalizedMotherId) {
+            return applySpouseIds({ ...member, updatedAt: now }, [...getSpouseIds(member), normalizedFatherId]);
+          }
+
           return member;
-        });
-      }
-
-      return sortByName(next);
+        })
+      );
     });
 
     window.alert("Relasi anggota berhasil diperbarui.");
@@ -4003,19 +4091,21 @@ export default function KeluargaKuMVP() {
         prev
           .filter((member) => member.id !== memberId)
           .map((member) => {
-            const spouseId = member.spouseId === memberId ? undefined : member.spouseId;
+            const nextSpouseIds = getSpouseIds(member).filter((id) => id !== memberId);
             const fatherId = member.fatherId === memberId ? undefined : member.fatherId;
             const motherId = member.motherId === memberId ? undefined : member.motherId;
             const relationChanged =
-              spouseId !== member.spouseId || fatherId !== member.fatherId || motherId !== member.motherId;
+              nextSpouseIds.length !== getSpouseIds(member).length || fatherId !== member.fatherId || motherId !== member.motherId;
 
-            return {
-              ...member,
-              spouseId,
-              fatherId,
-              motherId,
-              updatedAt: relationChanged ? new Date().toISOString() : member.updatedAt,
-            };
+            return applySpouseIds(
+              {
+                ...member,
+                fatherId,
+                motherId,
+                updatedAt: relationChanged ? new Date().toISOString() : member.updatedAt,
+              },
+              nextSpouseIds
+            );
           })
       )
     );
@@ -4024,6 +4114,24 @@ export default function KeluargaKuMVP() {
       const remaining = members.filter((member) => member.id !== memberId);
       setSelectedId(remaining[0]?.id || "");
     }
+  };
+
+  const handleRemoveSpouseLink = (memberId: string, spouseId: string) => {
+    setMembers((prev) => {
+      const now = new Date().toISOString();
+      return sortByName(
+        prev.map((member) => {
+          if (member.id === memberId) {
+            return applySpouseIds({ ...member, updatedAt: now }, getSpouseIds(member).filter((id) => id !== spouseId));
+          }
+          if (member.id === spouseId) {
+            return applySpouseIds({ ...member, updatedAt: now }, getSpouseIds(member).filter((id) => id !== memberId));
+          }
+          return member;
+        })
+      );
+    });
+    setRelationDraft((prev) => (prev.spouseId === spouseId ? { ...prev, spouseId: "unassigned" } : prev));
   };
 
   const handlePrintTree = () => {
@@ -4116,7 +4224,10 @@ export default function KeluargaKuMVP() {
     const publicGetMember = (id?: string) => (id ? publicMemberMap.get(id) : undefined);
     const publicFather = publicGetMember(publicSelectedMember.fatherId);
     const publicMother = publicGetMember(publicSelectedMember.motherId);
-    const publicSpouse = publicGetMember(publicSelectedMember.spouseId);
+    const publicSpouseMembers = getSpouseIds(publicSelectedMember)
+      .map((id) => publicGetMember(id))
+      .filter(Boolean) as Member[];
+    const publicSpouse = publicSpouseMembers[0];
     const publicChildren = sortChildrenByBirthDate(
       publicMembers.filter((member) => member.fatherId === publicSelectedMember.id || member.motherId === publicSelectedMember.id)
     );
@@ -4246,7 +4357,7 @@ export default function KeluargaKuMVP() {
               <div className="grid gap-4 md:grid-cols-3">
                 <RelationCard title="Ayah" member={publicFather} onSelect={setPublicSelectedId} />
                 <RelationCard title="Ibu" member={publicMother} onSelect={setPublicSelectedId} />
-                <RelationCard title="Pasangan" member={publicSpouse} onSelect={setPublicSelectedId} />
+                <RelationCard title="Pasangan utama" member={publicSpouse} onSelect={setPublicSelectedId} />
               </div>
 
               <Card className="rounded-3xl shadow-sm overflow-hidden">
@@ -4262,9 +4373,22 @@ export default function KeluargaKuMVP() {
                           <TreeNode label="Ayah" member={publicFather} onSelect={setPublicSelectedId} />
                           <TreeNode label="Ibu" member={publicMother} onSelect={setPublicSelectedId} />
                         </div>
-                        <div className="flex justify-center gap-10">
+                        <div className="flex flex-col items-center gap-6 md:flex-row md:items-start md:justify-center md:gap-10">
                           <TreeNode label="Anggota terpilih" member={publicSelectedMember} onSelect={setPublicSelectedId} />
-                          <TreeNode label="Pasangan" member={publicSpouse} onSelect={setPublicSelectedId} />
+                          <div className="flex flex-wrap justify-center gap-6">
+                            {publicSpouseMembers.length ? (
+                              publicSpouseMembers.map((partner, index) => (
+                                <TreeNode
+                                  key={partner.id}
+                                  label={`Pasangan ${index + 1}`}
+                                  member={partner}
+                                  onSelect={setPublicSelectedId}
+                                />
+                              ))
+                            ) : (
+                              <TreeNode label="Pasangan" member={undefined} onSelect={setPublicSelectedId} />
+                            )}
+                          </div>
                         </div>
                         <div className="rounded-3xl border bg-white/70 p-5">
                           <div className="mb-4 text-center text-xs uppercase tracking-wide text-slate-500">Keturunan</div>
@@ -4272,6 +4396,33 @@ export default function KeluargaKuMVP() {
                         </div>
                       </div>
                     </div>
+                  </div>
+                </CardContent>
+              </Card>
+
+              <Card className="rounded-3xl shadow-sm">
+                <CardHeader>
+                  <CardTitle>Daftar pasangan</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <div className="space-y-2">
+                    {publicSpouseMembers.length ? (
+                      publicSpouseMembers.map((partner) => (
+                        <button key={partner.id} className="w-full text-left" onClick={() => setPublicSelectedId(partner.id)}>
+                          <div className="flex items-center gap-3 rounded-xl border p-3 hover:bg-slate-50 transition">
+                            <Avatar member={partner} size="sm" />
+                            <div className="min-w-0">
+                              <div className="font-medium truncate">{partner.name}</div>
+                              <div className="text-xs text-slate-500 truncate">
+                                {[partner.gender, partner.birthDate ? formatDate(partner.birthDate) : ""].filter(Boolean).join(" • ")}
+                              </div>
+                            </div>
+                          </div>
+                        </button>
+                      ))
+                    ) : (
+                      <div className="rounded-xl border border-dashed p-4 text-sm text-slate-500">Belum ada pasangan yang terhubung.</div>
+                    )}
                   </div>
                 </CardContent>
               </Card>
@@ -4290,7 +4441,17 @@ export default function KeluargaKuMVP() {
                             <div className="min-w-0">
                               <div className="font-medium truncate">{child.name}</div>
                               <div className="text-xs text-slate-500 truncate">
-                                {[child.gender, child.birthDate ? formatDate(child.birthDate) : ""].filter(Boolean).join(" • ")}
+                                {[
+                                  child.gender,
+                                  child.birthDate ? formatDate(child.birthDate) : "",
+                                  getChildBranchLabel(
+                                    child,
+                                    (publicShareState.type === "viewing" ? publicSelectedMember?.id : selectedMember?.id) || "",
+                                    publicShareState.type === "viewing" ? publicMembers : members
+                                  ),
+                                ]
+                                  .filter(Boolean)
+                                  .join(" • ")}
                               </div>
                             </div>
                           </div>
@@ -4311,7 +4472,10 @@ export default function KeluargaKuMVP() {
 
 const father = getMember(selectedMember?.fatherId);
   const mother = getMember(selectedMember?.motherId);
-  const spouse = getMember(selectedMember?.spouseId);
+  const spouseMembers = selectedMember
+    ? (getSpouseIds(selectedMember).map((id) => getMember(id)).filter(Boolean) as Member[])
+    : [];
+  const spouse = spouseMembers[0];
   const children = getChildren(selectedMember?.id);
   const siblingMembers = selectedMember
     ? sortChildrenByBirthDate(
@@ -5226,6 +5390,11 @@ const father = getMember(selectedMember?.fatherId);
                                   Pendiri utama
                                 </Badge>
                               ) : null}
+                              {spouseMembers.length > 1 ? (
+                                <Badge variant="outline" className="rounded-xl">
+                                  {spouseMembers.length} pasangan
+                                </Badge>
+                              ) : null}
                             </div>
                           </div>
                           <div className="grid gap-2 text-sm text-slate-700">
@@ -5295,20 +5464,25 @@ const father = getMember(selectedMember?.fatherId);
 
                     <div className="grid gap-4 md:grid-cols-2">
                       <div>
-                        <div className="mb-2 text-sm font-medium text-slate-800">Pasangan</div>
-                        {spouse ? (
-                          <Button
-                            variant="outline"
-                            className="rounded-2xl w-full justify-start"
-                            onClick={() => setSelectedId(spouse.id)}
-                          >
-                            {spouse.name}
-                          </Button>
-                        ) : (
-                          <div className="rounded-2xl border border-dashed px-4 py-3 text-sm text-slate-500">
-                            Belum ada pasangan terhubung.
-                          </div>
-                        )}
+                        <div className="mb-2 text-sm font-medium text-slate-800">Daftar pasangan</div>
+                        <div className="flex flex-wrap gap-2">
+                          {spouseMembers.length ? (
+                            spouseMembers.map((partner) => (
+                              <Button
+                                key={partner.id}
+                                variant="outline"
+                                className="rounded-2xl"
+                                onClick={() => setSelectedId(partner.id)}
+                              >
+                                {partner.name}
+                              </Button>
+                            ))
+                          ) : (
+                            <div className="rounded-2xl border border-dashed px-4 py-3 text-sm text-slate-500">
+                              Belum ada pasangan terhubung.
+                            </div>
+                          )}
+                        </div>
                       </div>
                       <div>
                         <div className="mb-2 text-sm font-medium text-slate-800">Saudara kandung</div>
@@ -5390,10 +5564,23 @@ const father = getMember(selectedMember?.fatherId);
                                 <TreeNode label="Ayah" member={father} onSelect={setSelectedId} />
                                 <TreeNode label="Ibu" member={mother} onSelect={setSelectedId} />
                               </div>
-                              <div className="flex justify-center gap-10">
-                                <TreeNode label="Anggota terpilih" member={selectedMember} onSelect={setSelectedId} />
-                                <TreeNode label="Pasangan" member={spouse} onSelect={setSelectedId} />
-                              </div>
+                              <div className="flex flex-col items-center gap-6 md:flex-row md:items-start md:justify-center md:gap-10">
+                          <TreeNode label="Anggota terpilih" member={selectedMember} onSelect={setSelectedId} />
+                          <div className="flex flex-wrap justify-center gap-6">
+                            {spouseMembers.length ? (
+                              spouseMembers.map((partner, index) => (
+                                <TreeNode
+                                  key={partner.id}
+                                  label={`Pasangan ${index + 1}`}
+                                  member={partner}
+                                  onSelect={setSelectedId}
+                                />
+                              ))
+                            ) : (
+                              <TreeNode label="Pasangan" member={undefined} onSelect={setSelectedId} />
+                            )}
+                          </div>
+                        </div>
                               <div className="rounded-3xl border bg-white/70 p-5">
                                 <div className="mb-4 text-center text-xs uppercase tracking-wide text-slate-500">Keturunan</div>
                                 <DescendantBranch parent={selectedMember} members={members} onSelect={setSelectedId} />
@@ -5494,7 +5681,7 @@ const father = getMember(selectedMember?.fatherId);
                     <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
                       <RelationCard title="Ayah" member={father} onSelect={setSelectedId} />
                       <RelationCard title="Ibu" member={mother} onSelect={setSelectedId} />
-                      <RelationCard title="Pasangan" member={spouse} onSelect={setSelectedId} />
+                      <RelationCard title="Pasangan utama" member={spouse} onSelect={setSelectedId} />
                       <Card className="rounded-2xl">
                         <CardHeader className="pb-3">
                           <CardDescription>Anak berurutan dari yang paling tua</CardDescription>
@@ -5524,6 +5711,39 @@ const father = getMember(selectedMember?.fatherId);
                         </CardContent>
                       </Card>
                     </div>
+
+                    <Card className="rounded-3xl shadow-sm mt-4">
+                      <CardHeader>
+                        <CardTitle>Daftar pasangan</CardTitle>
+                        <CardDescription>Satu anggota kini dapat memiliki lebih dari satu pasangan.</CardDescription>
+                      </CardHeader>
+                      <CardContent>
+                        <div className="space-y-2">
+                          {spouseMembers.length ? (
+                            spouseMembers.map((partner) => (
+                              <div key={partner.id} className="flex items-center justify-between gap-3 rounded-2xl border p-3">
+                                <button className="flex min-w-0 flex-1 items-center gap-3 text-left" onClick={() => setSelectedId(partner.id)}>
+                                  <Avatar member={partner} size="sm" />
+                                  <div className="min-w-0">
+                                    <div className="font-medium truncate">{partner.name}</div>
+                                    <div className="text-xs text-slate-500 truncate">
+                                      {[partner.gender, partner.birthDate ? formatDate(partner.birthDate) : ""].filter(Boolean).join(" • ")}
+                                    </div>
+                                  </div>
+                                </button>
+                                <Button variant="ghost" className="rounded-2xl" onClick={() => handleRemoveSpouseLink(selectedMember.id, partner.id)}>
+                                  Hapus relasi
+                                </Button>
+                              </div>
+                            ))
+                          ) : (
+                            <div className="rounded-2xl border border-dashed p-4 text-sm text-slate-500">
+                              Belum ada pasangan yang terhubung. Gunakan tombol Tambah pasangan untuk menambahkan pasangan baru tanpa menghapus pasangan lama.
+                            </div>
+                          )}
+                        </div>
+                      </CardContent>
+                    </Card>
                   </TabsContent>
                 </Tabs>
               </>
