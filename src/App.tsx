@@ -225,20 +225,30 @@ function reactNodeToText(node: React.ReactNode): string {
   if (node === null || node === undefined || typeof node === "boolean") return "";
   if (typeof node === "string" || typeof node === "number") return String(node);
   if (Array.isArray(node)) return node.map(reactNodeToText).join("");
-  if (React.isValidElement(node)) return reactNodeToText(node.props.children);
+  if (React.isValidElement(node)) {
+    const element = node as React.ReactElement<{ children?: React.ReactNode }>;
+    return reactNodeToText(element.props.children);
+  }
   return "";
 }
 
 function extractSelectItems(children: React.ReactNode, items: SelectItemDef[] = []): SelectItemDef[] {
   React.Children.forEach(children, (child) => {
     if (!React.isValidElement(child)) return;
-    if ((child.type as any)?.displayName === "LocalSelectItem") {
-      const label = reactNodeToText(child.props.children).trim();
-      items.push({ value: child.props.value, label });
+
+    const element = child as React.ReactElement<{
+      value?: string;
+      children?: React.ReactNode;
+    }>;
+
+    if ((element.type as any)?.displayName === "LocalSelectItem") {
+      const label = reactNodeToText(element.props.children).trim();
+      items.push({ value: element.props.value || "", label });
       return;
     }
-    if (child.props?.children) {
-      extractSelectItems(child.props.children, items);
+
+    if (element.props?.children) {
+      extractSelectItems(element.props.children, items);
     }
   });
   return items;
@@ -1515,7 +1525,7 @@ function validateMemberForm(form: FormState) {
 function sanitizeImportedMembers(data: unknown): Member[] | null {
   if (!Array.isArray(data)) return null;
 
-  const normalized = data
+  const normalized: Member[] = data
     .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
     .map((item, index) => {
       const createdAt =
@@ -1523,13 +1533,18 @@ function sanitizeImportedMembers(data: unknown): Member[] | null {
       const updatedAt =
         typeof item.updatedAt === "string" && item.updatedAt ? item.updatedAt : createdAt;
 
+      const gender: Gender =
+        item.gender === "Laki-laki" || item.gender === "Perempuan"
+          ? (item.gender as Gender)
+          : "";
+
       return {
         id:
           typeof item.id === "string" && item.id.trim()
             ? item.id
             : `m-import-${index + 1}-${uid()}`,
         name: typeof item.name === "string" ? item.name.trim() : "",
-        gender: item.gender === "Laki-laki" || item.gender === "Perempuan" ? item.gender : "",
+        gender,
         birthDate: typeof item.birthDate === "string" ? item.birthDate : undefined,
         address: typeof item.address === "string" ? item.address.trim() : "",
         phone: typeof item.phone === "string" ? item.phone.trim() : "",
@@ -3768,10 +3783,17 @@ export default function KeluargaKuMVP() {
     if (!selectedMember) return;
 
     const nextErrors = validateMemberForm({
-      ...selectedMember,
+      id: selectedMember.id,
+      name: selectedMember.name,
+      gender: selectedMember.gender,
+      birthDate: selectedMember.birthDate || "",
+      address: selectedMember.address,
+      phone: selectedMember.phone,
+      photo: selectedMember.photo || "",
       fatherId: relationDraft.fatherId,
       motherId: relationDraft.motherId,
       spouseId: relationDraft.spouseId,
+      notes: selectedMember.notes || "",
     });
 
     if (nextErrors.fatherId || nextErrors.motherId || nextErrors.spouseId) {
